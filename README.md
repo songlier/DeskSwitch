@@ -54,8 +54,13 @@ When the current switching direction has already reached the last desktop, deter
 Off: switching is triggered when the mouse enters the trigger corner    
 On: switching is triggered only when the mouse leaves the trigger corner. Releasing the mouse button in the trigger corner (for example, when dragging a window to the corner) or pressing the mouse button in the trigger corner (for example, clicking a window close button in the corner) will not trigger desktop switching    
   
-7. Automatically Disable the Top-right Corner    
+7. Window shortcut movement  
+Whether to enable the window shortcut movement function when there are only 1-2 desktops  
+Alt+Shift+left click: Move the current window to another desktop and switch to that desktop  
+Alt+Shift+right click: Move the current window to another desktop  
+   
+8. Automatically Disable the Top-right Corner    
 In dual-corner mode, when there are only 1-2 desktops, the top-right corner is disabled. Only the top-left corner can trigger switching, and desktops are switched cyclically    
   
-8. Other Settings    
+9. Other Settings    
 Timing-related settings that usually do not need adjustment  

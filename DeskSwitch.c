@@ -59,8 +59,10 @@ static DWORD kRepeatInterval = 560;
 static DWORD kAutoSwitch = 0;
 // 离开时触发 [0:关闭, 1:左上角, 2:右上角, 3:全部(默认)]
 static DWORD kCloseProtect = 3;
-// 自动屏蔽右上角 [0:不屏蔽, 1:屏蔽(默认)]
-static DWORD kDisableTopRightWhenDesktopLE2 = 1;
+// 窗口快捷移动 [0:关闭(默认), 1:左键, 2:右键, 3:开启]
+static DWORD kAltShiftClickMode = 0;
+// 自动屏蔽右上角 [0:不屏蔽(默认), 1:屏蔽]
+static DWORD kDisableTopRightWhenDesktopLE2 = 0;
 // 动画切换的按键等待时间 [默认:10]
 static DWORD kKeystrokeSleep = 10;
 // 新建桌面等待时间 [默认:50]
@@ -231,7 +233,8 @@ void LoadSpeedConfig()
     configMap["// 连续切换时间间隔 [默认:560]"] = &kRepeatInterval;
     configMap["// 自动反向切换 [0:关闭(默认), 1:开启]"] = &kAutoSwitch;
     configMap["// 离开时触发 [0:关闭, 1:左上角, 2:右上角, 3:全部(默认)]"] = &kCloseProtect;
-    configMap["// 自动屏蔽右上角 [0:不屏蔽, 1:屏蔽(默认)]"] = &kDisableTopRightWhenDesktopLE2;
+    configMap["// 窗口快捷移动 [0:关闭(默认), 1:左键, 2:右键, 3:开启]"] = &kAltShiftClickMode;
+    configMap["// 自动屏蔽右上角 [0:不屏蔽(默认), 1:屏蔽]"] = &kDisableTopRightWhenDesktopLE2;
     configMap["// 动画切换的按键等待时间 [默认:10]"] = &kKeystrokeSleep;
     configMap["// 新建桌面等待时间 [默认:50]"] = &kNewDesktopWait;
     configMap["// 重置状态计时 [默认:50]"] = &kLeaveCornerPollInterval;
@@ -263,6 +266,10 @@ void LoadSpeedConfig()
         }
     }
     file.close();
+    if (kAltShiftClickMode > 3)
+    {
+        kAltShiftClickMode = 3;
+    }
     g_bSingleCornerMode = (kCornerMode != 0);
     g_bAutoSwitch = (kAutoSwitch != 0);
     g_bKeepSwitch = (kKeepSwitch != 0);
@@ -473,6 +480,21 @@ static BOOL IsCornerProtected(int corner)
         return (corner == 2);
     case 3:
         return (corner == 1 || corner == 2);
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL IsAltShiftClickAllowed(int button)
+{
+    switch (kAltShiftClickMode)
+    {
+    case 1:
+        return (button == 1);
+    case 2:
+        return (button == 2);
+    case 3:
+        return (button == 1 || button == 2);
     default:
         return FALSE;
     }
@@ -882,7 +904,7 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONDOWN:
         {
             UpdateCloseProtectButtonStateChanged();
-            if (GetKeyState(VK_MENU) < 0 && GetKeyState(VK_SHIFT) < 0)
+            if (IsAltShiftClickAllowed(1) && GetKeyState(VK_MENU) < 0 && GetKeyState(VK_SHIFT) < 0)
             {
                 int desktopCount = g_pGetDesktopCount();
                 if (desktopCount == 2)
@@ -924,7 +946,7 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
         case WM_RBUTTONDOWN:
         {
             UpdateCloseProtectButtonStateChanged();
-            if (GetKeyState(VK_MENU) < 0 && GetKeyState(VK_SHIFT) < 0)
+            if (IsAltShiftClickAllowed(2) && GetKeyState(VK_MENU) < 0 && GetKeyState(VK_SHIFT) < 0)
             {
                 int desktopCount = g_pGetDesktopCount();
                 if (desktopCount == 2)
