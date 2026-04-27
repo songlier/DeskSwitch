@@ -36,8 +36,30 @@ static GoToDesktopNumberProc g_pGoToDesktopNumber = NULL;
 static MoveWindowToDesktopNumberProc g_pMoveWindowToDesktopNumber = NULL;
 static HMODULE g_hVdaDll = NULL;
 #define KEYDOWN(k) ((k) & 0x80)
-static RECT kHotCorner_topleft = {0, 0, 4, 4};
-static RECT kHotCorner_topright = {-4, 0, 0, 4};
+
+#define HOT_AREA_VALUE_ABS 0
+#define HOT_AREA_VALUE_PERCENT 1
+
+typedef struct HotAreaValue
+{
+    int type;
+    double percent;
+    long offsetPx;
+    long absValue;
+} HotAreaValue;
+
+typedef struct HotAreaSpec
+{
+    HotAreaValue left;
+    HotAreaValue top;
+    HotAreaValue right;
+    HotAreaValue bottom;
+} HotAreaSpec;
+
+static HotAreaSpec kHotCorner_in_topleft;
+static HotAreaSpec kHotCorner_in_topright;
+static HotAreaSpec kHotCorner_out_topleft;
+static HotAreaSpec kHotCorner_out_topright;
 static const DWORD kHotKeyModifiers = MOD_CONTROL | MOD_ALT;
 static const DWORD kHotKey = VK_ESCAPE;
 static const DWORD kExitHotKeyModifiers = MOD_CONTROL | MOD_SHIFT | MOD_ALT;
@@ -107,6 +129,8 @@ static BOOL g_bSuppressRightClickUp = FALSE;
 static BOOL g_bSuppressLeftClickUp = FALSE;
 static BOOL g_bDisableTopRightWhenDesktopLE2 = TRUE;
 static volatile int g_iTriggeredCorner = 0;
+static volatile LONG g_lAreaScreenWidth = 0;
+static volatile LONG g_lAreaScreenHeight = 0;
 
 std::wstring GetExePath()
 {
@@ -163,29 +187,167 @@ static void UpdateCloseProtectButtonStateChanged()
     }
 }
 
+static HotAreaValue MakeAreaAbs(long v)
+{
+    HotAreaValue value;
+    value.type = HOT_AREA_VALUE_ABS;
+    value.percent = 0.0;
+    value.offsetPx = 0;
+    value.absValue = v;
+    return value;
+}
+
+static HotAreaValue MakeAreaPercent(double percent, long offsetPx)
+{
+    HotAreaValue value;
+    value.type = HOT_AREA_VALUE_PERCENT;
+    value.percent = percent;
+    value.offsetPx = offsetPx;
+    value.absValue = 0;
+    return value;
+}
+
+static long ResolveAreaValue(const HotAreaValue &value, int total)
+{
+    if (value.type == HOT_AREA_VALUE_PERCENT)
+    {
+        return (long)(total * (value.percent / 100.0) + value.offsetPx);
+    }
+    return value.absValue;
+}
+
+static void RefreshAreaScreenSize()
+{
+    MONITORINFO mi = {sizeof(mi)};
+    if (GetMonitorInfo(MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY), &mi))
+    {
+        InterlockedExchange(&g_lAreaScreenWidth, mi.rcMonitor.right - mi.rcMonitor.left);
+        InterlockedExchange(&g_lAreaScreenHeight, mi.rcMonitor.bottom - mi.rcMonitor.top);
+    }
+}
+
+static void GetCachedAreaScreenSize(int *screenWidth, int *screenHeight)
+{
+    LONG width = InterlockedCompareExchange(&g_lAreaScreenWidth, 0, 0);
+    LONG height = InterlockedCompareExchange(&g_lAreaScreenHeight, 0, 0);
+    if (width <= 0 || height <= 0)
+    {
+        RefreshAreaScreenSize();
+        width = InterlockedCompareExchange(&g_lAreaScreenWidth, 0, 0);
+        height = InterlockedCompareExchange(&g_lAreaScreenHeight, 0, 0);
+    }
+    *screenWidth = (int)width;
+    *screenHeight = (int)height;
+}
+
+static RECT ResolveHotAreaRect(const HotAreaSpec &spec)
+{
+    int screenWidth = 0;
+    int screenHeight = 0;
+    GetCachedAreaScreenSize(&screenWidth, &screenHeight);
+
+    RECT rc;
+    rc.left = ResolveAreaValue(spec.left, screenWidth);
+    rc.top = ResolveAreaValue(spec.top, screenHeight);
+    rc.right = ResolveAreaValue(spec.right, screenWidth);
+    rc.bottom = ResolveAreaValue(spec.bottom, screenHeight);
+    return rc;
+}
+
+static BOOL PtInHotArea(const HotAreaSpec &spec, POINT pt)
+{
+    RECT rc = ResolveHotAreaRect(spec);
+    return PtInRect(&rc, pt);
+}
+
+static std::string TrimAreaString(std::string s)
+{
+    size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return "";
+    size_t last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+static HotAreaValue ParseAreaValue(std::string s)
+{
+    s = TrimAreaString(s);
+
+    std::string compact;
+    for (size_t i = 0; i < s.size(); ++i)
+    {
+        if (s[i] != ' ' && s[i] != '\t' && s[i] != '\r' && s[i] != '\n')
+        {
+            compact.push_back(s[i]);
+        }
+    }
+
+    size_t percentPos = compact.find('%');
+    if (percentPos != std::string::npos)
+    {
+        double percent = atof(compact.substr(0, percentPos).c_str());
+        long offsetPx = 0;
+
+        std::string suffix = compact.substr(percentPos + 1);
+        if (!suffix.empty() && (suffix[0] == '+' || suffix[0] == '-'))
+        {
+            offsetPx = strtol(suffix.c_str(), NULL, 10);
+        }
+
+        return MakeAreaPercent(percent, offsetPx);
+    }
+
+    return MakeAreaAbs((long)atoi(compact.c_str()));
+}
+
+static BOOL ParseHotAreaSpec(const std::string &vals, HotAreaSpec *outSpec)
+{
+    std::vector<std::string> parts;
+    size_t last = 0, next = 0;
+    while ((next = vals.find(',', last)) != std::string::npos)
+    {
+        parts.push_back(vals.substr(last, next - last));
+        last = next + 1;
+    }
+    parts.push_back(vals.substr(last));
+
+    if (parts.size() != 4)
+    {
+        return FALSE;
+    }
+
+    outSpec->left = ParseAreaValue(parts[0]);
+    outSpec->top = ParseAreaValue(parts[1]);
+    outSpec->right = ParseAreaValue(parts[2]);
+    outSpec->bottom = ParseAreaValue(parts[3]);
+    return TRUE;
+}
+
+static void SetDefaultAreaConfig()
+{
+    kHotCorner_in_topleft.left = MakeAreaAbs(0);
+    kHotCorner_in_topleft.top = MakeAreaAbs(0);
+    kHotCorner_in_topleft.right = MakeAreaAbs(4);
+    kHotCorner_in_topleft.bottom = MakeAreaAbs(4);
+
+    kHotCorner_in_topright.left = MakeAreaPercent(100.0, -4);
+    kHotCorner_in_topright.top = MakeAreaAbs(0);
+    kHotCorner_in_topright.right = MakeAreaPercent(100.0, 0);
+    kHotCorner_in_topright.bottom = MakeAreaAbs(4);
+
+    kHotCorner_out_topleft = kHotCorner_in_topleft;
+    kHotCorner_out_topright = kHotCorner_in_topright;
+}
+
 void LoadAreaConfig()
 {
     std::wstring path = GetExePath() + L"\\area.txt";
     std::ifstream file(path.c_str());
-    MONITORINFO mi = {sizeof(mi)};
-    GetMonitorInfo(MonitorFromWindow(NULL, MONITOR_DEFAULTTOPRIMARY), &mi);
-    int screenWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-    int screenHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
-    kHotCorner_topleft = {0, 0, 4, 4};
-    kHotCorner_topright = {screenWidth - 4, 0, screenWidth, 4};
+    SetDefaultAreaConfig();
+    RefreshAreaScreenSize();
     if (!file.is_open())
         return;
-    auto ParseValue = [](std::string s, int total) -> long
-    {
-        s.erase(0, s.find_first_not_of(" "));
-        s.erase(s.find_last_not_of(" ") + 1);
-        if (s.find('%') != std::string::npos)
-        {
-            float percent = (float)atof(s.c_str());
-            return (long)(total * (percent / 100.0f));
-        }
-        return (long)atoi(s.c_str());
-    };
+
     std::string line;
     while (std::getline(file, line))
     {
@@ -193,26 +355,36 @@ void LoadAreaConfig()
             continue;
         size_t start = line.find('{');
         size_t end = line.find('}');
+        if (end == std::string::npos || end <= start)
+            continue;
+        size_t eq = line.find('=');
+        std::string key;
+        if (eq != std::string::npos && eq < start)
+            key = TrimAreaString(line.substr(0, eq));
+        else
+            key = TrimAreaString(line.substr(0, start));
         std::string vals = line.substr(start + 1, end - start - 1);
-        std::vector<std::string> parts;
-        size_t last = 0, next = 0;
-        while ((next = vals.find(',', last)) != std::string::npos)
+        HotAreaSpec temp;
+        if (ParseHotAreaSpec(vals, &temp))
         {
-            parts.push_back(vals.substr(last, next - last));
-            last = next + 1;
-        }
-        parts.push_back(vals.substr(last));
-        if (parts.size() == 4)
-        {
-            RECT temp;
-            temp.left = ParseValue(parts[0], screenWidth);
-            temp.top = ParseValue(parts[1], screenHeight);
-            temp.right = ParseValue(parts[2], screenWidth);
-            temp.bottom = ParseValue(parts[3], screenHeight);
-            if (line.find("topleft") != std::string::npos)
-                kHotCorner_topleft = temp;
-            else if (line.find("topright") != std::string::npos)
-                kHotCorner_topright = temp;
+            if (key == "in_topleft")
+                kHotCorner_in_topleft = temp;
+            else if (key == "in_topright")
+                kHotCorner_in_topright = temp;
+            else if (key == "out_topleft")
+                kHotCorner_out_topleft = temp;
+            else if (key == "out_topright")
+                kHotCorner_out_topright = temp;
+            else if (key == "topleft")
+            {
+                kHotCorner_in_topleft = temp;
+                kHotCorner_out_topleft = temp;
+            }
+            else if (key == "topright")
+            {
+                kHotCorner_in_topright = temp;
+                kHotCorner_out_topright = temp;
+            }
         }
     }
     file.close();
@@ -588,7 +760,11 @@ static DWORD WINAPI CornerWorkerThread(LPVOID lpParameter)
         WaitForSingleObject(g_hHotCornerEvent, INFINITE);
         if (g_bAppIsExiting)
             break;
+        RefreshAreaScreenSize();
         int bounceCount = 0;
+        int heldCorner = g_iTriggeredCorner;
+        if (heldCorner != 1 && heldCorner != 2)
+            heldCorner = 0;
         while (!g_bAppIsExiting)
         {
             POINT Point;
@@ -597,13 +773,24 @@ static DWORD WINAPI CornerWorkerThread(LPVOID lpParameter)
             if ((forcedCorner == 1 || forcedCorner == 2) && IsCornerEnabled((int)forcedCorner))
             {
                 activeCorner = (int)forcedCorner;
+                heldCorner = activeCorner;
             }
             else if (GetCursorPos(&Point))
             {
-                if (PtInRect(&kHotCorner_topleft, Point) && IsCornerEnabled(1))
+                if (heldCorner == 1 && PtInHotArea(kHotCorner_out_topleft, Point) && IsCornerEnabled(1))
                     activeCorner = 1;
-                else if (PtInRect(&kHotCorner_topright, Point) && IsCornerEnabled(2))
+                else if (heldCorner == 2 && PtInHotArea(kHotCorner_out_topright, Point) && IsCornerEnabled(2))
                     activeCorner = 2;
+                else if (PtInHotArea(kHotCorner_in_topleft, Point) && IsCornerEnabled(1))
+                {
+                    activeCorner = 1;
+                    heldCorner = 1;
+                }
+                else if (PtInHotArea(kHotCorner_in_topright, Point) && IsCornerEnabled(2))
+                {
+                    activeCorner = 2;
+                    heldCorner = 2;
+                }
             }
             if (activeCorner == 0)
             {
@@ -877,8 +1064,8 @@ static DWORD WINAPI CornerWorkerThread(LPVOID lpParameter)
             POINT ptWait;
             if (GetCursorPos(&ptWait))
             {
-                BOOL inTopLeft = IsCornerEnabled(1) && PtInRect(&kHotCorner_topleft, ptWait);
-                BOOL inTopRight = IsCornerEnabled(2) && PtInRect(&kHotCorner_topright, ptWait);
+                BOOL inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, ptWait);
+                BOOL inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, ptWait);
                 if (!inTopLeft && !inTopRight)
                     break;
             }
@@ -988,12 +1175,32 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
         {
             POINT pt;
             int currentCorner = 0;
+            BOOL outTopLeft = FALSE;
+            BOOL outTopRight = FALSE;
             if (GetCursorPos(&pt))
             {
-                if (PtInRect(&kHotCorner_topleft, pt) && IsCornerEnabled(1))
+                BOOL inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_in_topleft, pt);
+                BOOL inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_in_topright, pt);
+                outTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, pt);
+                outTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, pt);
+                if (inTopLeft)
                     currentCorner = 1;
-                else if (PtInRect(&kHotCorner_topright, pt) && IsCornerEnabled(2))
+                else if (inTopRight)
                     currentCorner = 2;
+
+                if (currentCorner != 0 && g_iTriggeredCorner != currentCorner)
+                {
+                    RefreshAreaScreenSize();
+                    inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_in_topleft, pt);
+                    inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_in_topright, pt);
+                    outTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, pt);
+                    outTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, pt);
+                    currentCorner = 0;
+                    if (inTopLeft)
+                        currentCorner = 1;
+                    else if (inTopRight)
+                        currentCorner = 2;
+                }
             }
             LONG armedCorner = InterlockedCompareExchange(&g_lCloseProtectCorner, 0, 0);
             if (g_bCloseProtectArmed)
@@ -1002,9 +1209,14 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
             }
             if (g_bCloseProtectArmed)
             {
-                if (currentCorner == armedCorner)
+                BOOL stillInArmedOutArea = FALSE;
+                if (armedCorner == 1)
+                    stillInArmedOutArea = outTopLeft;
+                else if (armedCorner == 2)
+                    stillInArmedOutArea = outTopRight;
+                if (stillInArmedOutArea)
                 {
-                    g_iTriggeredCorner = currentCorner;
+                    g_iTriggeredCorner = (int)armedCorner;
                     break;
                 }
                 else
@@ -1046,8 +1258,11 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
             }
             else
             {
-                g_iTriggeredCorner = 0;
-                ResetSingleCornerState();
+                if (!outTopLeft && !outTopRight)
+                {
+                    g_iTriggeredCorner = 0;
+                    ResetSingleCornerState();
+                }
             }
             break;
         }
