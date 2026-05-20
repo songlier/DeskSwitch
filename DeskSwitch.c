@@ -79,6 +79,8 @@ static DWORD kKeepSwitch = 0;
 static DWORD kRepeatInterval = 560;
 // 自动反向切换 [0:关闭(默认), 1:开启]
 static DWORD kAutoSwitch = 0;
+// 只有一个桌面时自动创建桌面 [0:关闭(默认), 1:开启]
+static DWORD autoadd = 0;
 // 离开时触发 [0:关闭, 1:左上角, 2:右上角, 3:全部(默认)]
 static DWORD kCloseProtect = 3;
 // 窗口快捷移动 [0:关闭(默认), 1:左键, 2:右键, 3:开启]
@@ -131,6 +133,11 @@ static BOOL g_bDisableTopRightWhenDesktopLE2 = TRUE;
 static volatile int g_iTriggeredCorner = 0;
 static volatile LONG g_lAreaScreenWidth = 0;
 static volatile LONG g_lAreaScreenHeight = 0;
+
+typedef BOOL (*SingleDesktopHandlerProc)(BOOL wasDragging);
+static BOOL HandleSingleDesktopAutoAdd(BOOL wasDragging);
+static BOOL HandleSingleDesktopBlocked(BOOL wasDragging);
+static SingleDesktopHandlerProc g_pHandleSingleDesktop = HandleSingleDesktopAutoAdd;
 
 std::wstring GetExePath()
 {
@@ -404,6 +411,8 @@ void LoadSpeedConfig()
     configMap["// 连续切换 [0:关闭(默认), 1:开启]"] = &kKeepSwitch;
     configMap["// 连续切换时间间隔 [默认:560]"] = &kRepeatInterval;
     configMap["// 自动反向切换 [0:关闭(默认), 1:开启]"] = &kAutoSwitch;
+    configMap["// 只有一个桌面时自动创建桌面 [0:关闭(默认), 1:开启]"] = &autoadd;
+    configMap["autoadd"] = &autoadd;
     configMap["// 离开时触发 [0:关闭, 1:左上角, 2:右上角, 3:全部(默认)]"] = &kCloseProtect;
     configMap["// 窗口快捷移动 [0:关闭(默认), 1:左键, 2:右键, 3:开启]"] = &kAltShiftClickMode;
     configMap["// 自动屏蔽右上角 [0:不屏蔽(默认), 1:屏蔽]"] = &kDisableTopRightWhenDesktopLE2;
@@ -444,6 +453,7 @@ void LoadSpeedConfig()
     }
     g_bSingleCornerMode = (kCornerMode != 0);
     g_bAutoSwitch = (kAutoSwitch != 0);
+    g_pHandleSingleDesktop = (autoadd != 0) ? HandleSingleDesktopAutoAdd : HandleSingleDesktopBlocked;
     g_bKeepSwitch = (kKeepSwitch != 0);
     if (g_bKeepSwitch)
     {
@@ -698,6 +708,47 @@ static BOOL IsCornerEnabled(int corner)
     return FALSE;
 }
 
+static BOOL HandleSingleDesktopBlocked(BOOL wasDragging)
+{
+    (void)wasDragging;
+    return FALSE;
+}
+
+static BOOL HandleSingleDesktopAutoAdd(BOOL wasDragging)
+{
+    if (wasDragging)
+    {
+        HWND hRootWnd = GetForegroundWindow();
+        if (hRootWnd != NULL)
+        {
+            LeaveCriticalSection(&g_cs);
+            CreateNewDesktop();
+            Sleep(kNewDesktopWait);
+            g_pMoveWindowToDesktopNumber(hRootWnd, 1);
+            EnterCriticalSection(&g_cs);
+            g_bJustCreatedDesktop = TRUE;
+            if (g_bSingleCornerMode)
+            {
+                g_dwLastSwitchTime = GetTickCount();
+                g_nLastDesktopNumber = 0;
+            }
+        }
+    }
+    else
+    {
+        LeaveCriticalSection(&g_cs);
+        CreateNewDesktop();
+        Sleep(kNewDesktopWait);
+        EnterCriticalSection(&g_cs);
+        if (g_bSingleCornerMode)
+        {
+            g_dwLastSwitchTime = GetTickCount();
+            g_nLastDesktopNumber = 0;
+        }
+    }
+    return TRUE;
+}
+
 static void ResetSingleCornerState()
 {
     g_bJustCreatedDesktop = FALSE;
@@ -819,35 +870,10 @@ static DWORD WINAPI CornerWorkerThread(LPVOID lpParameter)
             int desktopCount = g_pGetDesktopCount();
             if (desktopCount < 2)
             {
-                if (wasDragging)
-                {
-                    HWND hRootWnd = GetForegroundWindow();
-                    if (hRootWnd != NULL)
-                    {
-                        LeaveCriticalSection(&g_cs);
-                        CreateNewDesktop();
-                        Sleep(kNewDesktopWait);
-                        g_pMoveWindowToDesktopNumber(hRootWnd, 1);
-                        EnterCriticalSection(&g_cs);
-                        g_bJustCreatedDesktop = TRUE;
-                        if (g_bSingleCornerMode)
-                        {
-                            g_dwLastSwitchTime = GetTickCount();
-                            g_nLastDesktopNumber = 0;
-                        }
-                    }
-                }
-                else
+                if (!g_pHandleSingleDesktop(wasDragging))
                 {
                     LeaveCriticalSection(&g_cs);
-                    CreateNewDesktop();
-                    Sleep(kNewDesktopWait);
-                    EnterCriticalSection(&g_cs);
-                    if (g_bSingleCornerMode)
-                    {
-                        g_dwLastSwitchTime = GetTickCount();
-                        g_nLastDesktopNumber = 0;
-                    }
+                    goto WaitForLeave;
                 }
                 LeaveCriticalSection(&g_cs);
                 if (g_bSingleCornerMode)
@@ -1064,8 +1090,8 @@ static DWORD WINAPI CornerWorkerThread(LPVOID lpParameter)
             POINT ptWait;
             if (GetCursorPos(&ptWait))
             {
-                BOOL inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, ptWait);
-                BOOL inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, ptWait);
+                BOOL inTopLeft = PtInHotArea(kHotCorner_out_topleft, ptWait) && IsCornerEnabled(1);
+                BOOL inTopRight = PtInHotArea(kHotCorner_out_topright, ptWait) && IsCornerEnabled(2);
                 if (!inTopLeft && !inTopRight)
                     break;
             }
@@ -1179,10 +1205,10 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
             BOOL outTopRight = FALSE;
             if (GetCursorPos(&pt))
             {
-                BOOL inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_in_topleft, pt);
-                BOOL inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_in_topright, pt);
-                outTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, pt);
-                outTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, pt);
+                BOOL inTopLeft = PtInHotArea(kHotCorner_in_topleft, pt) && IsCornerEnabled(1);
+                BOOL inTopRight = PtInHotArea(kHotCorner_in_topright, pt) && IsCornerEnabled(2);
+                outTopLeft = PtInHotArea(kHotCorner_out_topleft, pt) && IsCornerEnabled(1);
+                outTopRight = PtInHotArea(kHotCorner_out_topright, pt) && IsCornerEnabled(2);
                 if (inTopLeft)
                     currentCorner = 1;
                 else if (inTopRight)
@@ -1191,10 +1217,10 @@ static LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lPara
                 if (currentCorner != 0 && g_iTriggeredCorner != currentCorner)
                 {
                     RefreshAreaScreenSize();
-                    inTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_in_topleft, pt);
-                    inTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_in_topright, pt);
-                    outTopLeft = IsCornerEnabled(1) && PtInHotArea(kHotCorner_out_topleft, pt);
-                    outTopRight = IsCornerEnabled(2) && PtInHotArea(kHotCorner_out_topright, pt);
+                    inTopLeft = PtInHotArea(kHotCorner_in_topleft, pt) && IsCornerEnabled(1);
+                    inTopRight = PtInHotArea(kHotCorner_in_topright, pt) && IsCornerEnabled(2);
+                    outTopLeft = PtInHotArea(kHotCorner_out_topleft, pt) && IsCornerEnabled(1);
+                    outTopRight = PtInHotArea(kHotCorner_out_topright, pt) && IsCornerEnabled(2);
                     currentCorner = 0;
                     if (inTopLeft)
                         currentCorner = 1;
